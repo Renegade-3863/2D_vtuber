@@ -1,0 +1,33 @@
+# --- Core renderer ---
+torch>=2.0.0
+torchvision
+numpy>=1.22
+Pillow>=9.0
+opencv-python>=4.5
+pygame>=2.5
+
+# --- Camera-based head tracking ---
+mediapipe>=0.10
+
+# --- LLM (Azure OpenAI) ---
+openai>=1.30
+python-dotenv>=1.0
+pydantic>=2.0
+
+# --- TTS engines ---
+edge-tts>=6.1                # built-in default
+dashscope>=1.20              # CosyVoice cloud (recommended)
+TTS>=0.22                    # Coqui XTTS v2 (optional, voice cloning)
+requests>=2.31               # GPT-SoVITS local API (optional)
+
+# --- Forced alignment (for TTS engines without word boundaries) ---
+whisperx>=3.1
+faster-whisper>=1.0
+
+# --- STT ---
+SpeechRecognition>=3.10
+pyaudio>=0.2.13              # microphone capture
+
+# --- Background removal helper (helpers/remove_background.py) ---
+rembg>=2.0
+onnxruntime>=1.16
