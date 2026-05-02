@@ -43,7 +43,7 @@ import importlib.util
 
 _spec = importlib.util.spec_from_file_location(
     "tha_module",
-    str(Path(__file__).parent / "tha_lip_sync_render.py"),
+    str(Path(__file__).resolve().parents[1] / "ai_runtime" / "tha_lip_sync_render.py"),
 )
 _tha = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_tha)
@@ -51,7 +51,11 @@ _spec.loader.exec_module(_tha)
 IdlePerformance = _tha.IdlePerformance
 IdleAnimator = _tha.IdleAnimator
 add_pose = _tha.add_pose
-smooth_pose = _tha.smooth_pose
+
+
+def smooth_pose(current, target, alpha=0.35):
+    """平滑插值，alpha 越大变化越快"""
+    return [c + (t - c) * alpha for c, t in zip(current, target)]
 
 # ── 动画名 → 数字键映射 ─────────────────────────────────
 PERF_NAMES = [p[0] for p in IdlePerformance.PERFORMANCES]

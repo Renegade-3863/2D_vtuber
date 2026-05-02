@@ -5,8 +5,7 @@ import sys
 import time
 import threading
 import queue
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -22,7 +21,7 @@ from tha3.util import extract_pytorch_image_from_PIL_image, rgba_to_numpy_image
 from ai_runtime.tha_pose_mapper import THAPoseMapper
 from ai_runtime.llm_api_client import LLMApiClient
 from ai_runtime.tts_client import TTSClient, VOICE_CATALOG, DEFAULT_VOICE_KEY, list_voices, resolve_voice
-from ai_runtime.phoneme_mouth_mapper import PhonemeMouthMapper, PhonemeFrame
+from ai_runtime.phoneme_mouth_mapper import PhonemeMouthMapper
 from ai_runtime.audio_phoneme_aligner import AudioPhonemeAligner
 from ai_runtime.face_tracker import FaceTracker
 from ai_runtime.stt_client import STTClient
@@ -60,15 +59,6 @@ INPUT_MODE_ENV_KEY = "THA_INPUT_MODE"
 # threshold for closing the mouth
 SILENCE_THRESHOLD = 0.10  # 100ms 以上的真空隙才认为是停顿，避免连读时误判
 
-# Module for character states machine
-class InteractionState(Enum):
-    """角色交互状态机"""
-    IDLE = "idle"            # 空闲：放松、随机注视、正常眨眼
-    LISTENING = "listening"  # 倾听：注视用户、微微前倾、偶尔点头
-    THINKING = "thinking"    # 思考：眼神飘移、歪头、皱眉
-    SPEAKING = "speaking"    # 说话：口型同步、手势、情绪表达
-    POST_SPEAK = "post_speak"  # 说完过渡：微微放松、短暂停顿后回到 idle
-
 # The shared board between the input loop and the render loop, holding the current state of the character
 # Handle cross thread data synchronization with locks
 @dataclass
@@ -95,86 +85,10 @@ class RenderState:
     audio_path: str = None  
     # tts object, used to get the real-time playback position for better lip sync (especially for long sentences)
     tts: object = None 
-    # Emotion timeline is used by the poser to switch between different emotions during one single response. aiming to make the character more lively and less static.
-    # TODO: Optiomize this 
-    emotion_timeline: list = None
     # The current interaction state of the character, used to guide the motion animation during idle time like in games or vtuber live streaming.
     interaction_state: str = "idle"  
     # The time when the current interaction state enters
     state_enter_time: float = 0.0   
-
-# Build the emotion timeline based on LLM segments and TTS word boundaries
-def _build_emotion_timeline(                  
-    segments: list,
-    word_boundaries: list,
-    total_duration: float,
-) -> list:
-    """
-    根据 LLM 返回的 segments 和 TTS 的 word_boundaries，
-    构建 [(offset_sec, emotion, intensity), ...] 时间线。
-
-    原理：将各 segment 的文本长度按比例映射到 word_boundaries 的时间轴上。
-    """
-    if not segments:
-        return [(0.0, "neutral", 0.5)]
-    if len(segments) == 1:
-        seg = segments[0]
-        return [(0.0, seg.get("emotion", "neutral"), float(seg.get("intensity", 0.5)))]
-
-    # 计算每个 segment 的字符数和累计字符边界
-    seg_char_ends = []  # 每段结束的字符位置
-    char_count = 0
-    for seg in segments:
-        char_count += len(seg.get("text", ""))
-        seg_char_ends.append(char_count)
-    total_chars = char_count
-
-    if total_chars == 0:
-        return [(0.0, "neutral", 0.5)]
-
-    # 用 word_boundaries 建立"已朗读字符数 → 时间"的映射
-    # word_boundaries: [{text, offset, duration, end}, ...]
-    char_time_map = []  # [(累计字符数, 该词的起始时间)]
-    spoken_chars = 0
-    if word_boundaries:
-        for wb in word_boundaries:
-            char_time_map.append((spoken_chars, wb.offset))
-            spoken_chars += len(wb.text)
-        # 结尾哨兵
-        char_time_map.append((spoken_chars, total_duration))
-
-    def chars_to_time(char_pos: int) -> float:
-        """将字符位置转换为时间偏移"""
-        if not char_time_map:
-            # 没有 word_boundaries → 按字符比例估算
-            return (char_pos / total_chars) * total_duration
-        # 在 char_time_map 中找到该字符位置对应的时间
-        for i in range(len(char_time_map) - 1):
-            c0, t0 = char_time_map[i]
-            c1, t1 = char_time_map[i + 1]
-            if c0 <= char_pos <= c1:
-                if c1 == c0:
-                    return t0
-                frac = (char_pos - c0) / (c1 - c0)
-                return t0 + frac * (t1 - t0)
-        return total_duration
-
-    timeline = []
-    prev_end = 0
-    for i, seg in enumerate(segments):
-        offset = chars_to_time(prev_end)
-        emo = seg.get("emotion", "neutral")
-        inten = float(seg.get("intensity", 0.5))
-        timeline.append((offset, emo, inten))
-        prev_end = seg_char_ends[i]
-
-    return timeline
-
-
-def smooth_pose(current, target, alpha=0.35):
-    """平滑插值，alpha 越大变化越快"""
-    return [c + (t - c) * alpha for c, t in zip(current, target)]
-
 
 def add_pose(base: list, add: dict, name_to_idx: dict, name_to_range: dict):
     for k, v in add.items():
@@ -1638,22 +1552,8 @@ def render_loop(
             audio_duration = state.audio_duration
             interaction_state = state.interaction_state
             state_enter_time = state.state_enter_time
-            emotion_timeline = state.emotion_timeline
 
         speaking_active = bool(speaking_flag and (audio_duration <= 0.0 or now - speak_start < audio_duration))
-
-        # 情绪时间线：说话时根据播放进度切换情绪
-        if speaking_active and emotion_timeline and len(emotion_timeline) > 1:
-            elapsed = now - speak_start
-            # 找到当前应该使用的 segment
-            cur_emo, cur_int = emotion_timeline[0][1], emotion_timeline[0][2]
-            for t_offset, emo, inten in emotion_timeline:
-                if elapsed >= t_offset:
-                    cur_emo, cur_int = emo, inten
-                else:
-                    break
-            emotion = cur_emo
-            intensity = cur_int
 
         # 自动状态转换：说话结束 → POST_SPEAK → IDLE
         if interaction_state == "speaking" and not speaking_active:
@@ -2584,7 +2484,6 @@ def input_loop(
             with state_lock:
                 state.emotion = item["emotion"]
                 state.intensity = item["intensity"]
-                state.emotion_timeline = [(0.0, item["emotion"], item["intensity"])]
                 if first:
                     state.motion_hint = motion_hint
                 state.speaking = True

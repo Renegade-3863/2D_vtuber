@@ -45,20 +45,22 @@ def _detect_lang(text: str) -> str:
 
 
 def _fix_wav_header(audio_bytes: bytes) -> bytes:
-    """修复流式 WAV 头中错误的 RIFF/data 长度字段。
+    """Fix invalid RIFF/data size fields in streamed WAV headers.
 
-    DashScope 在 streaming 模式下，第一个 chunk 内的 WAV header 已经包含了
-    占位的 chunk-size / data-size 字段（通常为 0 或 0xFFFFFFFF），因为流开始
-    时还不知道总字节数。直接落盘后 wave.open / pygame.mixer.Sound 都会读不到
-    正确的帧数：wave 返回 dur=0 被 sanity check 静默丢弃，pygame 抛
-    "Out of memory"，最终 get_audio_duration 走文件大小估算返回错误时长，
-    并且音频根本播不出来。
+    In DashScope streaming mode, the first audio chunk may already contain a
+    WAV header with placeholder chunk-size / data-size fields, usually 0 or
+    0xFFFFFFFF, because the final stream length is not known yet. If those
+    bytes are written directly to disk, wave.open / pygame.mixer.Sound may not
+    be able to read the correct frame count: wave can report dur=0, pygame may
+    raise "Out of memory", and get_audio_duration may fall back to a wrong
+    file-size estimate. In that case, audio playback can fail completely.
 
-    这里在落盘前根据真实总长回填 RIFF chunk size 和 data sub-chunk size。
+    Before saving the file, patch the RIFF chunk size and data sub-chunk size
+    using the actual byte length.
     """
     if len(audio_bytes) < 44 or audio_bytes[:4] != b"RIFF" or audio_bytes[8:12] != b"WAVE":
         return audio_bytes
-    # 标准 PCM WAV: "data" 子块紧跟在 16 字节 fmt 之后, 即偏移 36
+    # Standard PCM WAV: the "data" chunk follows the 16-byte fmt chunk at offset 36.
     if audio_bytes[36:40] != b"data":
         return audio_bytes
     ba = bytearray(audio_bytes)
@@ -107,10 +109,11 @@ class CosyVoiceClient:
         self._playback_start_time: float = 0.0
         self._is_playing: bool = False
         self._audio_position: float = 0.0
-        # CosyVoice äº‘ç«¯ TTS æ˜¯æ— çŠ¶æ€çš„ï¼šæ¯æ¬¡ generate_audio éƒ½æ–°å»º
-        # SpeechSynthesizerï¼Œæ‰€ä»¥å¤šçº¿ç¨‹å¹¶å‘è°ƒç”¨ generate_audio_full() å®‰å…¨ï¼›
-        # ä½† self.word_boundaries è¿™ä¸ªå…±äº«çŠ¶æ€æ˜¯æœ‰ç«žæ€çš„ï¼Œå¹¶å‘è·¯å¾„è¯·ç”¨
-        # generate_audio_full() æ‹¿è¿”å›žå€¼ã€‚
+        # CosyVoice cloud TTS is stateless: generate_audio creates a new
+        # SpeechSynthesizer for every request, so concurrent calls to
+        # generate_audio_full() are safe. self.word_boundaries is shared state,
+        # though, so concurrent producer paths should use generate_audio_full()
+        # and consume the returned boundaries directly.
 
     # ---- synthesis -------------------------------------------------------
 
@@ -123,8 +126,8 @@ class CosyVoiceClient:
 
     def generate_audio(self, text: str) -> tuple[str | None, float]:
         path, duration, boundaries = self._generate_full(text)
-        # ç”¨é”ä¿è¯ self.word_boundaries ä¸Žæœ¬æ¬¡è¿”å›žçš„ path/duration ä¸€è‡´
-        # ï¼ˆå¤šçº¿ç¨‹ä¸‹ç”Ÿäº§è€…åº”ç›´æŽ¥è°ƒç”¨ generate_audio_fullï¼‰ã€‚
+        # Keep self.word_boundaries aligned with this path/duration pair.
+        # Multi-threaded producers should call generate_audio_full() directly.
         self.word_boundaries = boundaries
         return path, duration
 
@@ -135,8 +138,10 @@ class CosyVoiceClient:
 
         from dashscope.audio.tts_v2 import SpeechSynthesizer, AudioFormat
 
-        # SDK æŠŠ ws æ¡æ‰‹è¶…æ—¶ hard-code æˆ 5 ç§’ï¼ˆä¸”éƒ¨åˆ†è°ƒç”¨ç‚¹æ˜¾å¼ä¼  5ï¼‰ï¼Œ
-        # é¦–æ¬¡è¿žæŽ¥ç»å¸¸ >5s å¤±è´¥ã€‚Monkey patch å¼ºåˆ¶å¿½ç•¥å…¥å‚ï¼Œä½¿ç”¨æˆ‘ä»¬çš„å€¼ã€‚
+        # The SDK hard-codes a 5s WebSocket handshake timeout in some paths,
+        # and the first connection can often take longer than that. Monkey
+        # patch the private connector to ignore the caller-provided timeout and
+        # use our configurable value instead.
         try:
             _conn = SpeechSynthesizer.__dict__.get("_SpeechSynthesizer__connect")
             if _conn and not getattr(_conn, "_tha_patched", False):
@@ -146,7 +151,7 @@ class CosyVoiceClient:
 
                 @functools.wraps(orig)
                 def _patched(self, timeout_seconds=ws_to):
-                    # å¿½ç•¥è°ƒç”¨æ–¹ä¼ å…¥çš„å°è¶…æ—¶å€¼
+                    # Ignore too-small timeout values supplied by the SDK call path.
                     return orig(self, timeout_seconds=ws_to)
                 _patched._tha_patched = True
                 setattr(SpeechSynthesizer, "_SpeechSynthesizer__connect", _patched)
@@ -173,7 +178,7 @@ class CosyVoiceClient:
             # Native word timestamp: supported by cosyvoice-v3-flash / v3-plus
             # / v2 (cloned voices, plus a subset of marked system voices).
             # For these models we enable it automatically and skip WhisperX
-            # downstream. v3.5-* models don't support it â€” fall back to
+            # downstream. v3.5-* models don't support it; fall back to
             # WhisperX path. Force-disable with THA_COSYVOICE_WORD_TS=0.
             additional_params: dict = {}
             captured_words: list[dict] = []
@@ -196,7 +201,7 @@ class CosyVoiceClient:
 
                     done_evt = threading.Event()
                     timing = {"open": None, "started": None, "first_audio": None, "complete": None}
-                    t_call_start = [0.0]  # ç”±å¤–éƒ¨è®¾ç½®
+                    t_call_start = [0.0]  # Reserved for external timing updates.
 
                     class _TSCallback(ResultCallback):
                         def on_open(self):
@@ -218,11 +223,16 @@ class CosyVoiceClient:
                                     timing["started"] = time.time()
                                 words = (msg or {}).get("payload", {}).get("output", {}).get("sentence", {}).get("words")
                                 if words:
-                                    # CosyVoice 流式 sentence 事件的 words 字段行为不统一:
-                                    #  - 短句: 每次回「从头到当前」全量累积
-                                    #  - 长句多 sentence: 每次只回当前 sentence 的 words
-                                    # 直接 extend 会重复, 直接覆盖会丢早期 sentence 的字。
-                                    # 这里全量收下, 在最后阶段按 begin_time 去重。
+                                    # CosyVoice streaming sentence events are
+                                    # inconsistent for the words field:
+                                    #  - short text: each event may return the
+                                    #    full cumulative list from the start
+                                    #  - long multi-sentence text: each event
+                                    #    may return only the current sentence
+                                    # Appending directly creates duplicates,
+                                    # but replacing directly can drop earlier
+                                    # sentences. Collect all events, then
+                                    # deduplicate by begin_time at the end.
                                     captured_words.extend(words)
                             except Exception:
                                 pass
@@ -246,13 +256,15 @@ class CosyVoiceClient:
 
             synthesizer = SpeechSynthesizer(**kwargs)
             t_call_start_v = time.time()
-            # ä¼˜å…ˆç”¨ streaming_call APIã€‚å’Œ call() æ¯”ï¼š
-            #   - æ˜¾å¼åŠåŒå·¥æµï¼ŒSDK å†…éƒ¨èµ° chunk-level pipelineï¼Œ
-            #     é¦–å— PCM é€šå¸¸æ¯” call() å¿« 100-300ms
-            #   - æ”¯æŒåŽç»­å¤šæ¬¡ streaming_call(ç»§ç»­è¿½åŠ æ–‡æœ¬)ï¼Œ
-            #     è™½ç„¶è¿™é‡Œåªç”¨å•æ¬¡ï¼Œä½†ç•™å¥½æŽ¥å£ä¾¿äºŽåŽç»­ LLM token æµå¼
-            #   - streaming_complete() é˜»å¡žè‡³ on_complete/on_error
-            # THA_COSYVOICE_USE_LEGACY_CALL=1 å¯å›žé€€åˆ°æ—§ call()ã€‚
+            # Prefer the streaming_call API over call():
+            #   - It uses an explicit half-duplex stream and the SDK can run a
+            #     chunk-level pipeline internally, so the first PCM chunk is
+            #     usually 100-300ms faster than call().
+            #   - It supports multiple future streaming_call() invocations to
+            #     append more text. We only use one call here, but keeping this
+            #     path makes later LLM token streaming easier.
+            #   - streaming_complete() blocks until on_complete/on_error.
+            # Set THA_COSYVOICE_USE_LEGACY_CALL=1 to fall back to call().
             use_streaming = os.environ.get(
                 "THA_COSYVOICE_USE_LEGACY_CALL", "").strip().lower() not in ("1", "true", "yes")
             ret = None
@@ -260,20 +272,20 @@ class CosyVoiceClient:
                 try:
                     synthesizer.streaming_call(text)
                     if hasattr(synthesizer, "streaming_complete"):
-                        # è¯¥æ–¹æ³•æœ¬èº«ä¼šç­‰åˆ°åˆæˆç»“æŸï¼ˆä¹Ÿæ˜¯ on_completeï¼‰
+                        # This waits for synthesis completion, i.e. on_complete.
                         synthesizer.streaming_complete()
                 except Exception as e:
-                    # å…¼å®¹æ—§ SDK / ç½‘ç»œå¼‚å¸¸æ—¶é™çº§
+                    # Fallback for older SDKs or transient network errors.
                     print(f"[CosyVoice] streaming_call failed ({e}), fallback to call()")
                     ret = synthesizer.call(text)
             else:
                 ret = synthesizer.call(text)
-            # æœ‰ callback æ—¶ SDK ç«‹å³è¿”å›žï¼Œéœ€ç­‰ on_complete/on_error è§¦å‘
+            # With callbacks, the SDK may return immediately; wait for completion.
             if callback is not None:
                 wait_to = float(os.environ.get("THA_COSYVOICE_SYNTH_TIMEOUT", "60"))
                 if not done_evt.wait(timeout=wait_to):
                     print(f"[CosyVoice] synth wait timeout ({wait_to}s)")
-                # æ‰“å°åˆ†é˜¶æ®µè€—æ—¶
+                # Print phase timings for latency debugging.
                 def _ms(t): return f"{(t - t_call_start_v) * 1000:.0f}ms" if t else "n/a"
                 print(f"[CosyVoice] timing: open={_ms(timing['open'])} "
                       f"task-started={_ms(timing['started'])} "
@@ -281,7 +293,7 @@ class CosyVoiceClient:
                       f"complete={_ms(timing['complete'])}")
             audio_bytes = bytes(captured_audio) if callback is not None else ret
             if not audio_bytes:
-                # æŠŠæœåŠ¡ç«¯æœ€åŽä¸€æ¡æŠ¥æ–‡æ‰“å‡ºæ¥ä¾¿äºŽè¯Šæ–­
+                # Print the final server response to aid diagnosis.
                 try:
                     resp = synthesizer.get_response()
                     print(f"[CosyVoice] empty audio. server response: {resp}")
@@ -312,7 +324,7 @@ class CosyVoiceClient:
         # unsupported / disabled, downstream will fall back to WhisperX.
         boundaries: List[WordBoundary] = []
         if want_ts and captured_words:
-            # 先按 begin_time 去重 (sentence 事件可能重复推送同一个字)
+            # Deduplicate by begin_time; sentence events may repeat the same word.
             seen_keys: set = set()
             unique_words: list[dict] = []
             for w in captured_words:
@@ -350,8 +362,11 @@ class CosyVoiceClient:
         return path, duration, boundaries
 
     def generate_audio_full(self, text: str) -> tuple[str | None, float, List[WordBoundary]]:
-        """çº¿ç¨‹å®‰å…¨ç‰ˆæœ¬ï¼šç›´æŽ¥è¿”å›ž (path, duration, boundaries)ã€‚
-        ç”Ÿäº§è€…å¹¶å‘é¢„åˆæˆå¤šæ®µæ—¶ä½¿ç”¨ï¼Œä¸ä¾èµ–å…±äº«çš„ self.word_boundariesã€‚"""
+        """Thread-safe synthesis API returning (path, duration, boundaries).
+
+        Use this when producer threads pre-synthesize multiple segments in
+        parallel, so callers do not rely on the shared self.word_boundaries.
+        """
         return self._generate_full(text)
 
     # ---- compatibility shim ---------------------------------------------
@@ -364,17 +379,18 @@ class CosyVoiceClient:
             return 0.0
         return self._audio_position
 
-    # ---- gapless æ’­æ”¾ï¼šSound + Channel.queue() ----------------------
-    # ä¸ç”¨ pygame.mixer.musicï¼ŒåŽŸå› ï¼š
-    #   1) æ¯æ®µéƒ½ load() ä¼šæœ‰ ~30-50ms å¯åŠ¨é—´éš™ï¼ˆå¬æ„Ÿé¡¿æŒ«ï¼‰
-    #   2) mp3/wav è§£ç  warm-up åƒæŽ‰å‰ ~20ms å¤´éŸ³
-    #   3) get_busy() è½¬ False æ—¶ç¡¬ä»¶ buffer è¿˜æ²¡æŽ’ç©º â†’ å°¾è¢«åˆ‡
-    # Sound é¢„è§£ç ï¼ˆæ—  warm-upï¼‰ + Channel.queue() åœ¨æœ¬æ®µçœŸæ­£
-    # ç»“æŸé‚£ä¸€åˆ»æ— ç¼æŽ¥ä¸Šä¸‹ä¸€æ®µã€‚
+    # ---- gapless playback: Sound + Channel.queue() --------------------
+    # Avoid pygame.mixer.music because:
+    #   1) load() for every segment can add a ~30-50ms startup gap.
+    #   2) mp3/wav decode warm-up can eat the first ~20ms of audio.
+    #   3) get_busy() can turn False before the hardware buffer is drained,
+    #      which may cut the tail.
+    # Sound pre-decodes the segment, and Channel.queue() starts the next
+    # segment exactly when the current one finishes.
     #
-    # play_audio_async æ˜¯éžé˜»å¡žçš„ï¼šè¿”å›ž (start_evt, end_evt)ã€‚
-    # è°ƒç”¨æ–¹åº”åœ¨ä¸Šæ®µ end_evt è§¦å‘ä¹‹å‰æäº¤ä¸‹æ®µï¼Œpygame ä¼šè‡ªåŠ¨ queue()ï¼Œ
-    # è¿™æ ·ä¸Šä¸‹ä¸¤æ®µä¹‹é—´æ— ä»»ä½•é—´éš™ã€‚
+    # play_audio_async is non-blocking and returns (start_evt, end_evt).
+    # Submit the next segment before the previous end_evt fires; pygame will
+    # queue it automatically, leaving no gap between adjacent segments.
     def _ensure_channel(self):
         if not pygame.mixer.get_init():
             try:
@@ -389,9 +405,11 @@ class CosyVoiceClient:
         return ch
 
     def _get_gap_bytes(self):
-        """段间换气静音的原始字节（按 mixer 实际格式）。
-        默认 80ms，THA_COSYVOICE_GAP_MS=0 禁用。
-        返回 (bytes, gap_sec)。
+        """Build raw silence bytes for the breath gap between segments.
+
+        The bytes are generated using the active mixer format. The default gap
+        is 80ms; set THA_COSYVOICE_GAP_MS=0 to disable it.
+        Returns (bytes, gap_sec).
         """
         gap_ms = int(os.environ.get("THA_COSYVOICE_GAP_MS", "80"))
         if gap_ms <= 0:
@@ -415,12 +433,17 @@ class CosyVoiceClient:
             return b"", 0.0
 
     def play_audio_async(self, audio_path: str):
-        """éžé˜»å¡žï¼Œè¿”å›ž (start_evt, end_evt)ã€‚
-        - start_evt: æœ¬æ®µè¯­éŸ³çœŸæ­£å¼€å§‹æ’­æ”¾ï¼ˆå£åž‹/çŠ¶æ€åº”åœ¨æ­¤åˆ‡æ¢ï¼‰
-        - end_evt:   æœ¬æ®µè¯­éŸ³ç»“æŸï¼ˆä¸å« trailing gapï¼‰
-        æ®µé—´æ¢æ°”ï¼šåœ¨æ¯æ®µè¯­éŸ³å‰ prepend ä¸€æ®µé™éŸ³å¹¶åˆå¹¶ä¸ºå•ä¸ª Sound
-        æ’­æ”¾ï¼Œè¿™æ · channel é˜Ÿåˆ—åªå ä¸€æ§½ï¼Œä¸ä¼šè¢«ä¸‹ä¸€æ®µ queue è¦†ç›–ã€‚
-        é¦–æ®µ (was_busy=False) ä¸åŠ  leading silenceï¼Œé¿å…ç”¨æˆ·æ„ŸçŸ¥å»¶è¿Ÿã€‚
+        """Non-blocking playback that returns (start_evt, end_evt).
+
+        - start_evt: when this segment's voice audio actually starts; lip-sync
+          and state transitions should switch at this point.
+        - end_evt: when this segment's voice audio ends, excluding trailing gap.
+
+        For breath gaps between segments, prepend silence to each queued segment
+        and merge it into a single Sound object. This uses only one channel queue
+        slot and prevents the next segment from overwriting the silence. The
+        first segment (was_busy=False) skips leading silence to avoid perceived
+        latency.
         """
         start_evt = threading.Event()
         end_evt = threading.Event()
@@ -428,7 +451,7 @@ class CosyVoiceClient:
             start_evt.set()
             end_evt.set()
             return start_evt, end_evt
-        # 必须先确保 mixer 已初始化, 否则 pygame.mixer.Sound() 会抛 "mixer not initialized"
+        # Ensure the mixer is initialized before pygame.mixer.Sound().
         ch = self._ensure_channel()
         try:
             voice_sound = pygame.mixer.Sound(audio_path)
@@ -438,13 +461,13 @@ class CosyVoiceClient:
             end_evt.set()
             return start_evt, end_evt
 
-        # 取上一段的 end_evt 用于估算本段开始时间
+        # Use the previous segment end time to estimate this segment's start.
         prev_end_evt = getattr(self, "_last_end_evt", None)
         prev_end_etime = float(getattr(self, "_last_end_etime", 0.0))
         was_busy = ch.get_busy()
         voice_dur = voice_sound.get_length()
 
-        # ä»…åœ¨ã€Œä¸Šæ®µè¿˜åœ¨æ’­ã€æ—¶ç»™æœ¬æ®µå‰é¢åŠ  silence ä½œä¸ºæ¢æ°”
+        # Add leading silence as a breath gap only while another segment is playing.
         leading_gap = 0.0
         play_sound = voice_sound
         if was_busy:
@@ -465,10 +488,10 @@ class CosyVoiceClient:
         else:
             ch.play(play_sound)
 
-        # æ—¶é—´é¢„ç®—ï¼š
-        #   padded sound çš„å¼€å§‹ = prev_end_etimeï¼ˆä¸Šæ®µè¯­éŸ³ç»“æŸçž¬é—´ï¼‰
-        #   æœ¬æ®µè¯­éŸ³çœŸæ­£å¼€å§‹    = padded å¼€å§‹ + leading_gap
-        #   æœ¬æ®µè¯­éŸ³ç»“æŸ        = è¯­éŸ³å¼€å§‹ + voice_dur
+        # Predict playback timing:
+        #   padded sound start = previous segment voice end time
+        #   this voice start   = padded sound start + leading_gap
+        #   this voice end     = this voice start + voice_dur
         if was_busy and prev_end_etime > 0:
             sound_start_etime = prev_end_etime
         else:
@@ -476,10 +499,11 @@ class CosyVoiceClient:
         seg_start_etime = sound_start_etime + leading_gap
         seg_end_etime = seg_start_etime + voice_dur
 
-        # ç•™ç»™ä¸‹ä¸€æ®µï¼šä¸‹ä¸€æ®µ padded sound åœ¨æœ¬æ®µè¯­éŸ³ç»“æŸçž¬é—´å¼€å§‹æ’­
+        # Store timing for the next segment; its padded sound starts exactly
+        # when this segment's voice audio ends.
         self._last_end_evt = end_evt
         self._last_end_etime = seg_end_etime
-        # é˜² GCï¼ˆChannel å†…éƒ¨å¯¹ Sound ä¼¼ä¹ŽåªæŒå¼±å¼•ç”¨ï¼‰
+        # Keep Sound objects alive; Channel appears to hold weak references.
         keep_alive = getattr(self, "_keep_alive_sounds", None)
         if keep_alive is None:
             keep_alive = []
@@ -489,7 +513,7 @@ class CosyVoiceClient:
             del keep_alive[:-8]
 
         def _watch():
-            # ç­‰åˆ°æœ¬æ®µè¯­éŸ³çœŸæ­£å¼€å§‹ï¼ˆleading silence æ’­å®Œï¼‰
+            # Wait until this segment's voice audio starts, after leading silence.
             wait_t = max(0.0, seg_start_etime - time.time())
             if wait_t > 0:
                 time.sleep(wait_t)
@@ -514,8 +538,11 @@ class CosyVoiceClient:
         return start_evt, end_evt
 
     def wait_playback(self) -> None:
-        """é˜»å¡žè‡³æœ€è¿‘ä¸€æ®µæ’­å®Œã€‚Channel ä»å¯èƒ½åœ¨æ’­ queue åŽç»­æ®µï¼Œ
-        ä½†è‡³å°‘ wait è°ƒç”¨æ–¹æäº¤çš„æœ€åŽä¸€æ®µå·²ç»“æŸã€‚"""
+        """Block until the most recently submitted segment has finished.
+
+        The channel may still be playing later queued segments, but the last
+        segment submitted by this caller has at least ended.
+        """
         evt = getattr(self, "_last_end_evt", None)
         if evt is not None:
             evt.wait(timeout=30.0)
