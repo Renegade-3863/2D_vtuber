@@ -263,6 +263,9 @@ def is_silence_gap(phoneme_frames: list, current_time: float, threshold: float =
     # ---- Case 2: 在某个 phoneme 内，且接近尾部并且后面有空隙 ----
     for i, frame in enumerate(phoneme_frames):
         if frame.start_time <= current_time < frame.end_time:
+            if str(frame.phoneme).lower().startswith('sil') and frame.duration >= threshold:
+                return True
+
             progress = (current_time - frame.start_time) / frame.duration if frame.duration > 0 else 0
 
             if i == len(phoneme_frames) - 1:

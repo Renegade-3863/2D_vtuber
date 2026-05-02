@@ -424,7 +424,7 @@ class AudioPhonemeAligner:
                       f"total={estimated_duration:.2f}s) → 降级估算")
             else:
                 frames = self._align_with_word_boundaries(
-                    word_boundaries, language, estimated_duration
+                    text, word_boundaries, language, estimated_duration
                 )
                 if frames:
                     return PhonemeAlignment(
@@ -436,7 +436,49 @@ class AudioPhonemeAligner:
         # 退回到加权估算
         return self._align_weighted(text, audio_path, estimated_duration, language)
 
-    def _smooth_word_boundaries(self, word_boundaries):
+    def _find_punctuation_gap_indices(self, text: str, word_boundaries) -> set[int]:
+        """Return boundary gap indices whose source text contains punctuation.
+
+        CosyVoice sometimes omits punctuation from word_timestamp events while
+        still leaving an audible pause in the audio. If we only look at adjacent
+        timestamp tokens, a true comma pause between two Chinese characters looks
+        like a normal non-punctuation gap and gets absorbed by smoothing. This
+        helper maps timestamp tokens back to the original text so those gaps are
+        preserved as silence frames.
+        """
+        if not text or not word_boundaries or len(word_boundaries) < 2:
+            return set()
+
+        positions: list[tuple[int, int] | None] = []
+        cursor = 0
+        for wb in word_boundaries:
+            token = (getattr(wb, 'text', '') or '').strip()
+            if not token:
+                positions.append(None)
+                continue
+            found = text.find(token, cursor)
+            if found < 0:
+                found = text.find(token)
+            if found < 0:
+                positions.append(None)
+                continue
+            start = found
+            end = found + len(token)
+            positions.append((start, end))
+            cursor = end
+
+        punct_gap_indices: set[int] = set()
+        for i in range(len(positions) - 1):
+            left = positions[i]
+            right = positions[i + 1]
+            if left is None or right is None:
+                continue
+            between = text[left[1]:right[0]]
+            if any(ch in PUNCTUATION_TO_SILENCE for ch in between):
+                punct_gap_indices.add(i)
+        return punct_gap_indices
+
+    def _smooth_word_boundaries(self, word_boundaries, punct_gap_indices: set[int] | None = None):
         """吸收 CosyVoice timestamp 字间假静音, 把 gap 50/50 分给两侧字。
 
         CosyVoice timestamp 的 begin/end 是「字音 onset 中心」, 不是字音的可听
@@ -459,6 +501,8 @@ class AudioPhonemeAligner:
                 return False
             return not ('\u4e00' <= s <= '\u9fff' or s.isalpha() or s.isdigit())
 
+        punct_gap_indices = punct_gap_indices or set()
+
         smoothed = [WordBoundary(text=wb.text, offset=wb.offset,
                                  duration=wb.duration, end=wb.end)
                     for wb in word_boundaries]
@@ -476,6 +520,8 @@ class AudioPhonemeAligner:
             gap = nxt.offset - cur.end
             if gap <= MIN_KEEP_GAP or gap >= MAX_ABSORB:
                 continue
+            if i in punct_gap_indices:
+                continue
             if is_punct(cur.text) or is_punct(nxt.text):
                 continue
             half = gap / 2.0
@@ -486,7 +532,7 @@ class AudioPhonemeAligner:
         return smoothed
 
     def _align_with_word_boundaries(
-        self, word_boundaries, language: str, total_duration: float
+        self, text: str, word_boundaries, language: str, total_duration: float
     ) -> List[PhonemeFrame]:
         """
         使用 TTS 引擎提供的精确词边界进行音素对齐
@@ -501,7 +547,8 @@ class AudioPhonemeAligner:
         # 实际上"今"字的 in 韵母会持续到 1.0s 左右, 所谓"静音"其实是字音延续。
         # 直接用原始 boundary 会让短字嘴型一闪而过 + 中间假闭嘴。
         # 修法: 字间 gap < ABSORB_GAP 时, 把 gap 50/50 分给前后两字 (吃掉假静音)。
-        word_boundaries = self._smooth_word_boundaries(word_boundaries)
+        punct_gap_indices = self._find_punctuation_gap_indices(text, word_boundaries)
+        word_boundaries = self._smooth_word_boundaries(word_boundaries, punct_gap_indices)
 
         frames: List[PhonemeFrame] = []
         MIN_SILENCE_GAP = 0.06  # 小于 60ms 的间隙不算停顿
